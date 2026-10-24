@@ -11,7 +11,8 @@
 #include <util/dstr.h>
 #include <sys/stat.h>
 #include <media-io/audio-math.h>
-#include <plugin-support.h>
+
+#define obs_log(level, format, ...) blog(level, "[image-reaction] " format, ##__VA_ARGS__)
 
 
 struct image_reaction_source {
@@ -24,8 +25,8 @@ struct image_reaction_source {
 	bool linear_alpha;
 	bool active;
 
-	gs_image_file4_t if41;
-	gs_image_file4_t if42;
+	gs_image_file_ex_t if41;
+	gs_image_file_ex_t if42;
 	
 	obs_weak_source_t *audio_source;
 	
@@ -60,24 +61,24 @@ static void image_reaction_source_load(struct image_reaction_source *context)
 {
 	for (int i = 0; i <=1; i++) {
 		char *file = i == 0 ? context->file1 : context->file2;
-		gs_image_file4_t *if4 = i == 0 ? &context->if41 : &context->if42;
+		gs_image_file_ex_t *if4 = i == 0 ? &context->if41 : &context->if42;
 
 		obs_enter_graphics();
-		gs_image_file4_free(if4);
+		gs_image_file_ex_free(if4);
 		obs_leave_graphics();
 		
 		if (file && *file) {
 			obs_log(LOG_DEBUG, "loading texture '%s'", file);
-			gs_image_file4_init(if4, file,
+			gs_image_file_ex_init(if4, file,
 					    context->linear_alpha
 						    ? GS_IMAGE_ALPHA_PREMULTIPLY_SRGB
 						    : GS_IMAGE_ALPHA_PREMULTIPLY);
 
 			obs_enter_graphics();
-			gs_image_file4_init_texture(if4);
+			gs_image_file_ex_init_texture(if4);
 			obs_leave_graphics();
 
-			if (!if4->image3.image2.image.loaded)
+			if (!if4->loaded)
 				obs_log(LOG_WARNING, "failed to load texture '%s'", file);
 		}
 	}
@@ -86,8 +87,8 @@ static void image_reaction_source_load(struct image_reaction_source *context)
 static void image_reaction_source_unload(struct image_reaction_source *context)
 {
 	obs_enter_graphics();
-	gs_image_file4_free(&context->if41);
-	gs_image_file4_free(&context->if42);
+	gs_image_file_ex_free(&context->if41);
+	gs_image_file_ex_free(&context->if42);
 	obs_leave_graphics();
 }
 
@@ -261,13 +262,13 @@ static void image_reaction_source_destroy(void *data)
 static uint32_t image_reaction_source_getwidth(void *data)
 {
 	struct image_reaction_source *context = data;
-	return MAX(context->if41.image3.image2.image.cx, context->if42.image3.image2.image.cx);
+	return MAX(context->if41.cx, context->if42.cx);
 }
 
 static uint32_t image_reaction_source_getheight(void *data)
 {
 	struct image_reaction_source *context = data;
-	return MAX(context->if41.image3.image2.image.cy, context->if42.image3.image2.image.cy);
+	return MAX(context->if41.cy, context->if42.cy);
 }
 
 static void image_reaction_source_render(void *data, gs_effect_t *effect)
@@ -279,15 +280,15 @@ static void image_reaction_source_render(void *data, gs_effect_t *effect)
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
 	
-	gs_image_file4_t *if4 = context->loud ? &context->if42 : &context->if41;
-	if (if4->image3.image2.image.texture)
+	gs_image_file_ex_t *if4 = context->loud ? &context->if42 : &context->if41;
+	if (if4->texture)
 	{
 		gs_eparam_t *const param = gs_effect_get_param_by_name(effect, "image");
-		gs_effect_set_texture_srgb(param, if4->image3.image2.image.texture);
+		gs_effect_set_texture_srgb(param, if4->texture);
 
-		gs_draw_sprite(if4->image3.image2.image.texture, 0,
-			       if4->image3.image2.image.cx,
-			       if4->image3.image2.image.cy);
+		gs_draw_sprite(if4->texture, 0,
+			       if4->cx,
+			       if4->cy);
 	}
 	//context->loud = false;
 
@@ -335,7 +336,7 @@ static void image_reaction_tick(void *data, float seconds)
 	uint64_t frame_time = obs_get_video_frame_time();
 	if (obs_source_active(context->source)) {
 		if (!context->active) {
-			if (context->if41.image3.image2.image.is_animated_gif || context->if42.image3.image2.image.is_animated_gif)
+			if (context->if41.is_animated_gif || context->if42.is_animated_gif)
 				context->last_time = frame_time;
 			context->active = true;
 		}
@@ -343,14 +344,14 @@ static void image_reaction_tick(void *data, float seconds)
 	} else {
 		if (context->active) {
 			for (int i = 0; i <=1; i++) {
-				gs_image_file4_t *if4 = i == 0 ? &context->if41 : &context->if42;
-				if (if4->image3.image2.image.is_animated_gif) {
-					if4->image3.image2.image.cur_frame = 0;
-					if4->image3.image2.image.cur_loop = 0;
-					if4->image3.image2.image.cur_time = 0;
+				gs_image_file_ex_t *if4 = i == 0 ? &context->if41 : &context->if42;
+				if (if4->is_animated_gif) {
+					if4->cur_frame = 0;
+					if4->cur_loop = 0;
+					if4->cur_time = 0;
 
 					obs_enter_graphics();
-					gs_image_file4_update_texture(if4);
+					gs_image_file_ex_update_texture(if4);
 					obs_leave_graphics();
 				}
 			}
@@ -360,27 +361,27 @@ static void image_reaction_tick(void *data, float seconds)
 	}
 
 	for (int i = 0; i <=1; i++) {
-		gs_image_file4_t *if4 = i == 0 ? &context->if41 : &context->if42;
+		gs_image_file_ex_t *if4 = i == 0 ? &context->if41 : &context->if42;
 		bool animReset = i == 0 ? context->animReset1 : context->animReset2;
 		
 
-		if (context->last_time && if4->image3.image2.image.is_animated_gif) {
+		if (context->last_time && if4->is_animated_gif) {
 			if (animReset && context->animResetTrigger) {
-				if4->image3.image2.image.cur_frame = 0;
-				if4->image3.image2.image.cur_loop = 0;
-				if4->image3.image2.image.cur_time = 0;
+				if4->cur_frame = 0;
+				if4->cur_loop = 0;
+				if4->cur_time = 0;
 
 				obs_enter_graphics();
-				gs_image_file4_update_texture(if4);
+				gs_image_file_ex_update_texture(if4);
 				obs_leave_graphics();
 			}
 			else {
 				uint64_t elapsed = frame_time - context->last_time;
-				bool updated = gs_image_file4_tick(if4, elapsed);
+				bool updated = gs_image_file_ex_tick(if4, elapsed);
 
 				if (updated) {
 					obs_enter_graphics();
-					gs_image_file4_update_texture(if4);
+					gs_image_file_ex_update_texture(if4);
 					obs_leave_graphics();
 				}
 			}
@@ -474,7 +475,7 @@ static obs_properties_t *image_reaction_source_properties(void *data)
 uint64_t image_reaction_source_get_memory_usage(void *data)
 {
 	struct image_reaction_source *s = data;
-	return s->if41.image3.image2.mem_usage + s->if42.image3.image2.mem_usage;
+	return s->if41.mem_usage + s->if42.mem_usage;
 }
 
 static void missing_file_callback(void *src, const char *new_path, void *data)
