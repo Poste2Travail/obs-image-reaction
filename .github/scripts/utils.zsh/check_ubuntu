@@ -24,11 +24,27 @@ if (( ! ${+commands[apt-get]} )) {
   log_debug "Apt-get located at ${commands[apt-get]}"
 }
 
+# Runner mirrors and DNS can fail transiently ("Temporary failure resolving ..."), so retry apt commands.
+apt_with_retry() {
+  local -i attempt
+  for attempt in 1 2 3; do
+    if "$@"; then
+      return 0
+    fi
+    if (( attempt < 3 )) {
+      log_warning "Attempt ${attempt} failed: $*. Retrying in 15 seconds..."
+      sleep 15
+    }
+  done
+  log_error "Failed after 3 attempts: $*"
+  return 2
+}
+
 local -a dependencies=("${(fA)$(<${SCRIPT_HOME}/.Aptfile)}")
 local -a install_list
 local binary
 
-sudo apt-get update -qq
+apt_with_retry sudo apt-get update -qq
 
 for dependency (${dependencies}) {
   local -a tokens=(${=dependency//(,|:|\')/})
@@ -54,7 +70,7 @@ if (( ${#install_list} )) {
   )
   if (( _loglevel == 0 )) apt_args+=(--quiet)
 
-  sudo apt-get ${apt_args} install ${install_list}
+  apt_with_retry sudo apt-get ${apt_args} install ${install_list}
 }
 
 rehash
