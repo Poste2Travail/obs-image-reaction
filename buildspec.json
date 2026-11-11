@@ -36,7 +36,7 @@
             "bundleId": "ru.scaledteam.image-reaction"
         }
     },
-    "name": "libimage-reaction",
+    "name": "image-reaction",
     "displayName": "Image Reaction",
     "version": "1.4.0",
     "author": "Alexandr Podgorniy",
