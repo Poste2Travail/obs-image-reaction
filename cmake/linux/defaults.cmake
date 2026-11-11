@@ -68,8 +68,7 @@ if(NOT TARGET OBS::libobs)
   # OBS itself is not configured (that would require FFmpeg and all its other dependencies).
   FetchContent_Declare(
     obs_headers
-    URL "https://github.com/obsproject/obs-studio/archive/refs/tags/${_obs_version}.tar.gz"
-    SOURCE_SUBDIR _headers_only
+    URL "https://github.com/obsproject/obs-studio/archive/refs/tags/${_obs_version}.tar.gz" SOURCE_SUBDIR _headers_only
   )
   FetchContent_MakeAvailable(obs_headers)
 
