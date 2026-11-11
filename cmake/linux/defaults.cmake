@@ -64,14 +64,25 @@ if(NOT TARGET OBS::libobs)
   string(JSON _obs_version GET "${_buildspec_json}" dependencies obs-studio version)
 
   include(FetchContent)
+  # SOURCE_SUBDIR points at a folder without a CMakeLists.txt, so the sources are only downloaded:
+  # OBS itself is not configured (that would require FFmpeg and all its other dependencies).
   FetchContent_Declare(
     obs_headers
     URL "https://github.com/obsproject/obs-studio/archive/refs/tags/${_obs_version}.tar.gz"
+    SOURCE_SUBDIR _headers_only
   )
   FetchContent_MakeAvailable(obs_headers)
 
+  # obs-config.h includes obsconfig.h, which OBS generates at configure time from obsconfig.h.in.
+  set(OBS_RELEASE_CANDIDATE 0)
+  set(OBS_BETA 0)
+  configure_file("${obs_headers_SOURCE_DIR}/libobs/obsconfig.h.in" "${obs_headers_BINARY_DIR}/config/obsconfig.h")
+
   add_library(OBS::libobs INTERFACE IMPORTED)
-  target_include_directories(OBS::libobs INTERFACE "${obs_headers_SOURCE_DIR}/libobs")
+  target_include_directories(
+    OBS::libobs
+    INTERFACE "${obs_headers_SOURCE_DIR}/libobs" "${obs_headers_BINARY_DIR}/config"
+  )
 endif()
 
 if(ENABLE_FRONTEND_API)
