@@ -13,5 +13,5 @@ elif (( ${1} >= 4 )); then
   log_output ${_usage}
 fi
 
-typeset -g -i -r _loglevel=${1}
+typeset -g -i _loglevel=${1}
 log_debug "Log level set to '${1}'"
