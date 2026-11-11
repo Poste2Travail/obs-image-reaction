@@ -1,137 +1,191 @@
-autoload -Uz log_error log_status log_warning log_debug log_group is-at-least
+#!/usr/bin/env zsh
 
-log_group 'Check Linux build requirements'
-log_debug 'Checking Linux distribution name and version...'
+builtin emulate -L zsh
+setopt EXTENDED_GLOB
+setopt PUSHD_SILENT
+setopt ERR_EXIT
+setopt ERR_RETURN
+setopt NO_UNSET
+setopt PIPE_FAIL
+setopt NO_AUTO_PUSHD
+setopt NO_PUSHD_IGNORE_DUPS
+setopt FUNCTION_ARGZERO
 
-# Ubuntu 22.10+ provides srt and librist through apt-get.
-# The file is /etc/os-release (hyphen). The previous version tested
-# /etc/os_release, which does not exist, so this flag was never set.
-typeset -g -i UBUNTU_2210_OR_LATER=0
-if [[ -f /etc/os-release ]] {
-  local dist_name dist_version
-  read -r dist_name dist_version <<< "$(source /etc/os-release; print -- "${NAME} ${VERSION_ID}")"
-  if [[ ${dist_name} == Ubuntu ]] && is-at-least 22.10 ${dist_version}; then
-    UBUNTU_2210_OR_LATER=1
-  fi
-} else {
-  log_warning 'No /etc/os-release found; cannot detect the distribution.'
-}
+## Enable for script debugging
+# setopt WARN_CREATE_GLOBAL
+# setopt WARN_NESTED_VAR
+# setopt XTRACE
 
-log_debug 'Checking for apt-get...'
-if (( ! ${+commands[apt-get]} )) {
-  log_error 'No apt-get command found. Please install apt'
-  return 2
-}
-log_debug "Apt-get located at ${commands[apt-get]}"
+autoload -Uz is-at-least && if ! is-at-least 5.2; then
+  print -u2 -PR "${CI:+::error::}%F{1}${funcstack[1]##*/}:%f Running on Zsh version %B${ZSH_VERSION}%b, but Zsh %B5.2%b is the minimum supported version. Upgrade Zsh to fix this issue."
+  exit 1
+fi
 
-# Packages that are useful but not required for the build. If they cannot be
-# installed, the step warns and continues instead of failing the job.
-typeset -g -a OPTIONAL_APT_PACKAGES=(ccache)
-
-# Ubuntu mirror hosts used by the runner's apt configuration.
-typeset -g -a APT_MIRROR_HOSTS=(
-  archive.ubuntu.com
-  security.ubuntu.com
-  azure.archive.ubuntu.com
-)
-
-# Warn early if none of the Ubuntu mirror hosts resolve. This is almost
-# always a DNS problem on the runner, which the script cannot fix itself.
-check_apt_mirrors() {
-  local host
-  for host (${APT_MIRROR_HOSTS}) {
-    if getent hosts ${host} >/dev/null 2>&1 {
-      return 0
-    }
-  }
-  log_warning "None of the Ubuntu mirror hosts resolve (${APT_MIRROR_HOSTS}). This is a DNS problem on the runner."
-  return 1
-}
-
-# Run a command up to 3 times with backoff (15s, then 30s).
-# Between attempts, refresh the package lists so a retry does not reuse
-# a half-fetched index.
-apt_with_retry() {
-  local -i attempt
-  local -i delay=15
-  for attempt in {1..3}; do
-    if "$@"; then
-      return 0
-    fi
-    if (( attempt < 3 )) {
-      log_warning "Attempt ${attempt} failed: $*. Retrying in ${delay} seconds..."
-      check_apt_mirrors || true
-      sleep ${delay}
-      (( delay *= 2 ))
-      sudo apt-get update -qq >/dev/null 2>&1 || true
-    }
-  done
-  log_error "Failed after 3 attempts: $*"
-  return 2
-}
-
-# Read the .Aptfile and collect the packages whose binary is not already on PATH.
-if [[ ! -f ${SCRIPT_HOME}/.Aptfile ]] {
-  log_error "Missing ${SCRIPT_HOME}/.Aptfile"
-  return 2
-}
-
-local -a dependencies=("${(fA)$(<${SCRIPT_HOME}/.Aptfile)}")
-local -a install_list=()
-local -a optional_list=()
-local -a tokens
-local binary pkg dependency
-
-for dependency (${dependencies}) {
-  tokens=(${=dependency//(,|:|\')/})
-
-  if [[ ${tokens[1]} != package ]] continue
-
-  if [[ ${#tokens} -gt 2 && ${tokens[3]} == bin ]] {
-    binary=${tokens[4]}
-  } else {
-    binary=${tokens[2]}
+TRAPZERR() {
+  if (( ${_loglevel:-3} > 2 )) {
+    print -u2 -PR "${CI:+::error::}%F{1}    ✖︎ script execution error%f"
+    print -PR -e "
+    Callstack:
+    ${(j:\n     :)funcfiletrace}
+    "
   }
 
-  if (( ${+commands[${binary}]} )) continue
-
-  pkg=${tokens[2]}
-  if (( ${OPTIONAL_APT_PACKAGES[(Ie)${pkg}]} )) {
-    optional_list+=(${pkg})
-  } else {
-    install_list+=(${pkg})
-  }
+  exit 2
 }
 
-log_debug "Required apt packages missing: ${install_list}"
-log_debug "Optional apt packages missing: ${optional_list}"
+package() {
+  if (( ! ${+SCRIPT_HOME} )) typeset -g SCRIPT_HOME=${ZSH_ARGZERO:A:h}
+  local host_os='ubuntu'
+  local project_root=${SCRIPT_HOME:A:h:h}
+  local buildspec_file=${project_root}/buildspec.json
 
-if (( ${#install_list} + ${#optional_list} )) {
-  if (( ! ${+CI} )) log_warning 'Dependency installation via apt may require elevated privileges'
+  fpath=("${SCRIPT_HOME}/utils.zsh" ${fpath})
+  autoload -Uz set_loglevel log_info log_group log_error log_output check_${host_os}
 
-  local -a apt_args=(
-    ${CI:+-y}
-    --no-install-recommends
+  if [[ ! -r ${buildspec_file} ]] {
+    log_error \
+      'No buildspec.json found. Please create a build specification for your project.'
+    return 2
+  }
+
+  local -i debug=0
+  local -i verbosity=1
+  local -r _version='2.0.0'
+  local -r -a _valid_targets=(
+    ubuntu-x86_64
   )
-  if (( _loglevel == 0 )) apt_args+=(--quiet)
+  local target
+  local config='RelWithDebInfo'
+  local -r -a _valid_configs=(Debug RelWithDebInfo Release MinSizeRel)
+  local -i codesign=0
+  local -i notarize=0
+  local -i package=0
+  local -i skip_deps=0
 
-  check_apt_mirrors || true
+  local -r _usage="
+Usage: %B${functrace[1]%:*}%b <option> [<options>]
 
-  # The package lists are needed for any install, so failure here is fatal.
-  apt_with_retry sudo apt-get update -qq || return 2
+%BOptions%b:
 
-  if (( ${#install_list} )) {
-    apt_with_retry sudo apt-get ${apt_args} install ${install_list} || return 2
+%F{yellow} Package configuration options%f
+ -----------------------------------------------------------------------------
+  %B-t | --target%b                     Specify target
+  %B-c | --config%b                     Build configuration
+  %B--skip-deps%b                       Skip checking for dependencies
+
+%F{yellow} Output options%f
+ -----------------------------------------------------------------------------
+  %B-q | --quiet%b                      Quiet (error output only)
+  %B-v | --verbose%b                    Verbose (more detailed output)
+  %B--debug%b                           Debug (very detailed and added output)
+
+%F{yellow} General options%f
+ -----------------------------------------------------------------------------
+  %B-h | --help%b                       Print this usage help
+  %B-V | --version%b                    Print script version information
+${_usage_host:-}"
+
+  local -a args
+  while (( # )) {
+    case ${1} {
+      -t|--target|-c|--config)
+        if (( # == 1 )) || [[ ${2:0:1} == '-' ]] {
+          log_error "Missing value for option %B${1}%b"
+          log_output ${_usage}
+          exit 2
+        }
+        ;;
+    }
+    case ${1} {
+      --)
+        shift
+        args+=($@)
+        break
+        ;;
+      -t|--target)
+        if (( ! ${_valid_targets[(Ie)${2}]} )) {
+          log_error "Invalid value %B${2}%b for option %B${1}%b"
+          log_output ${_usage}
+          exit 2
+        }
+        target=${2}
+        shift 2
+        ;;
+      -c|--config)
+        if (( !${_valid_configs[(Ie)${2}]} )) {
+          log_error "Invalid value %B${2}%b for option %B${1}%b"
+          log_output ${_usage}
+          exit 2
+        }
+        config=${2}
+        shift 2
+        ;;
+      -s|--codesign) typeset -g codesign=1; shift ;;
+      -n|--notarize) typeset -g notarize=1; typeset -g codesign=1; shift ;;
+      -p|--package) typeset -g package=1; shift ;;
+      --skip-deps) typeset -g skip_deps=1; shift ;;
+      -q|--quiet) (( verbosity -= 1 )) || true; shift ;;
+      -v|--verbose) (( verbosity += 1 )); shift ;;
+      -h|--help) log_output ${_usage}; exit 0 ;;
+      -V|--version) print -Pr "${_version}"; exit 0 ;;
+      --debug) verbosity=3; shift ;;
+      *) log_error "Unknown option: %B${1}%b"; log_output ${_usage}; exit 2 ;;
+    }
   }
 
-  if (( ${#optional_list} )) {
-    if ! apt_with_retry sudo apt-get ${apt_args} install ${optional_list}; then
-      log_warning "Optional packages could not be installed (${optional_list}). Continuing without them."
-    fi
+  : "${target:="${host_os}-${CPUTYPE}"}"
+
+  set -- ${(@)args}
+  set_loglevel ${verbosity}
+
+  if (( ! skip_deps )) {
+    check_${host_os}
   }
-} else {
-  log_status 'All apt build requirements are already installed.'
+
+  local product_name
+  local product_version
+  read -r product_name product_version <<< \
+    "$(jq -r '. | {name, version} | join(" ")' ${buildspec_file})"
+
+  local -a cmake_args=()
+  if (( _loglevel > 1 )) cmake_args+=(--verbose)
+
+  log_group "Creating source tarball for ${product_name}..."
+  pushd ${project_root}
+  cmake --build build_${target##*-} --config ${config} -t package_source ${cmake_args}
+  popd
+
+  if (( package )) {
+    log_group "Packaging ${product_name}..."
+    pushd ${project_root}
+    cmake --build build_${target##*-} --config ${config} -t package ${cmake_args}
+    popd
+  }
+
+  # User archive, always built: push and release runs also set package=true (which adds the .deb).
+  log_group "Archiving ${product_name}..."
+  local output_name="${product_name}-${product_version}-${target##*-}-ubuntu-gnu"
+  local _tarflags='cJf'
+  if (( _loglevel > 1 || ${+CI} )) _tarflags="v${_tarflags}"
+
+  # User layout, installed by copying the folder into $XDG_DATA_HOME/obs-studio/plugins/:
+  #   <name>/<name>.so and <name>/data/. The FHS lib/ and share/ tree is only for the .deb.
+  local -a plugin_binaries=(${project_root}/release/${config}/lib/*/obs-plugins/${product_name}.so(N))
+  if (( ! ${#plugin_binaries} )) {
+    log_error "No ${product_name}.so found under release/${config}/lib."
+    return 2
+  }
+
+  local stage_dir="$(mktemp -d)"
+  mkdir -p ${stage_dir}/${product_name}/data
+  cp ${plugin_binaries[1]} ${stage_dir}/${product_name}/
+  cp -R ${project_root}/release/${config}/share/obs/obs-plugins/${product_name}/. ${stage_dir}/${product_name}/data/
+
+  pushd ${stage_dir}
+  XZ_OPT=-T0 tar "-${_tarflags}" ${project_root}/release/${output_name}.tar.xz ${product_name}
+  popd
+  rm -rf ${stage_dir}
+  log_group
 }
 
-rehash
-log_group
+package ${@}
