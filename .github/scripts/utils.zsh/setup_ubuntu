@@ -1,54 +1,125 @@
-autoload -Uz log_error log_status log_info mkcd
+autoload -Uz log_error log_status log_info log_warning log_group is-at-least
 
-if (( ! ${+project_root} )) {
+# --- Required parameters -----------------------------------------------------
+
+# project_root: path to the obs-studio source tree (must contain buildspec.json)
+if (( ! ${+project_root} )) || [[ -z ${project_root} ]] {
   log_error "'project_root' not set. Please set before running ${0}."
   return 2
 }
 
-if (( ! ${+target} )) {
+# target: build target triplet, e.g. x86_64-linux-gnu or aarch64-linux-gnu
+if (( ! ${+target} )) || [[ -z ${target} ]] {
   log_error "'target' not set. Please set before running ${0}."
   return 2
 }
 
-pushd ${project_root}
+# QT_VERSION: Qt major version to install, must be 5 or 6
+if (( ! ${+QT_VERSION} )) || [[ -z ${QT_VERSION} ]] {
+  log_error "'QT_VERSION' not set (expected 5 or 6). Please set before running ${0}."
+  return 2
+}
 
-typeset -g QT_VERSION
+if [[ ${QT_VERSION} != (5|6) ]] {
+  log_error "Unsupported QT_VERSION '${QT_VERSION}' (expected 5 or 6)."
+  return 2
+}
 
-local -a apt_args=(
-  ${CI:+-y}
-  --no-install-recommends
-)
-if (( _loglevel == 0 )) apt_args+=(--quiet)
+# Enter the project root. Stop early if it does not exist, so later
+# relative paths (buildspec.json) are not resolved from the wrong directory.
+pushd -- ${project_root} || {
+  log_error "Cannot enter project_root '${project_root}'."
+  return 2
+}
 
+# --- Helpers -----------------------------------------------------------------
+
+# Run a command up to 3 times with exponential backoff (15s, then 30s).
+# Used for apt commands because Ubuntu mirror DNS failures are often transient.
+apt_with_retry() {
+  local -i attempt
+  local -i delay=15
+  for attempt in 1 2 3; do
+    if "$@"; then
+      return 0
+    fi
+    if (( attempt < 3 )) {
+      log_warning "Attempt ${attempt} failed: $*. Retrying in ${delay} seconds..."
+      sleep ${delay}
+      (( delay *= 2 ))
+    }
+  done
+  log_error "Failed after 3 attempts: $*"
+  return 2
+}
+
+# --- Installation ------------------------------------------------------------
+
+# Skip everything if the caller passed 'all' or 'deps' in $skips.
 if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
   log_group 'Installing obs-studio build dependencies...'
 
-  local suffix
-  if [[ ${CPUTYPE} != "${target##*-}" ]] {
+  # Base apt flags: auto-yes in CI, quieter output at low log levels.
+  local -a apt_args=(
+    ${CI:+-y}
+    --no-install-recommends
+  )
+  if (( _loglevel == 0 )) apt_args+=(--quiet)
+
+  # Architecture is the last dash-separated field of the target, e.g. "x86_64".
+  local arch=${target##*-}
+  local suffix=''
+
+  # Cross-compiling: install the GNU cross toolchain and set the Debian
+  # multiarch suffix (":arm64" or ":amd64") for the Qt packages later.
+  if [[ ${CPUTYPE} != ${arch} ]] {
     local -A arch_mappings=(
       aarch64 arm64
       x86_64 amd64
     )
+    # Fail early on architectures we have no Debian mapping for.
+    if (( ! ${+arch_mappings[${arch}]} )) {
+      log_error "Unsupported cross-compile target architecture '${arch}'."
+      return 2
+    }
 
-    suffix=":${arch_mappings[${target##*-}]}"
+    suffix=":${arch_mappings[${arch}]}"
+    # Convert "aarch64" style names to the GNU triplet prefix used by gcc packages.
+    local gnu_triplet=${arch//_/-}-linux-gnu
 
-    sudo apt-get install ${apt_args} gcc-${${target##*-}//_/-}-linux-gnu g++-${${target##*-}//_/-}-linux-gnu
+    # Refresh the package index before installing the cross toolchain.
+    apt_with_retry sudo apt-get update
+    apt_with_retry sudo apt-get install ${apt_args} \
+      gcc-${gnu_triplet} g++-${gnu_triplet}
   }
 
-  sudo apt-get update
+  # Refresh the package index for the native build dependencies.
+  apt_with_retry sudo apt-get update
 
-  sudo apt-get install ${apt_args} \
+  # Base build tools and libraries needed by OBS Studio.
+  apt_with_retry sudo apt-get install ${apt_args} \
     build-essential \
     ca-certificates \
     curl \
+    jq \
     libgles2-mesa-dev \
     libsimde-dev
 
-  # The OBS PPA is still on 32.x. Its headers do not declare gs_image_file_ex_t.
-  # The official Ubuntu 26.04 package for the buildspec version does, under /usr/local.
-  local obs_version
-  obs_version="$(jq -r '.dependencies["obs-studio"].version' ${project_root}/buildspec.json)"
+  # --- OBS Studio (official Ubuntu 26.04 package) ---------------------------
 
+  # The OBS PPA is still on 32.x, and its headers lack gs_image_file_ex_t.
+  # The official Ubuntu 26.04 package for the buildspec version provides it,
+  # installed under /usr/local.
+
+  # Read the pinned OBS version from buildspec.json.
+  local obs_version
+  obs_version="$(jq -r '.dependencies["obs-studio"].version // empty' ${project_root}/buildspec.json)"
+  if [[ -z ${obs_version} || ${obs_version} == null ]] {
+    log_error "No obs-studio version found in ${project_root}/buildspec.json."
+    return 2
+  }
+
+  # Expected SHA-256 of each supported OBS .deb. Add an entry when bumping OBS.
   local -A obs_deb_sha256=(
     33.0.0 f5844914eadd560314f3a9db020afa7a8afbefb67a26c488f2956dc339704918
   )
@@ -57,42 +128,58 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
     return 2
   }
 
+  # The .deb is built for Ubuntu 26.04 only, so refuse to run on older runners.
   if [[ -f /etc/os-release ]] {
     local dist_version
-    dist_version="$(source /etc/os-release && print ${VERSION_ID})"
-    autoload -Uz is-at-least
+    dist_version="$(source /etc/os-release && print -- ${VERSION_ID})"
     if ! is-at-least 26.04 ${dist_version}; then
       log_error "OBS Studio ${obs_version} requires the Ubuntu 26.04 runner. This runner is ${dist_version}."
       return 2
     fi
-  }
-
-  local obs_deb="OBS-Studio-${obs_version}-Ubuntu-26.04-${target##*-}.deb"
-  local obs_deb_path="/tmp/${obs_deb}"
-  local expected_hash="${obs_deb_sha256[${obs_version}]}"
-  local actual_hash=''
-  if [[ -f ${obs_deb_path} ]] actual_hash="${$(sha256sum ${obs_deb_path})%% *}"
-
-  if [[ ${actual_hash} != ${expected_hash} ]] {
-    log_info "Downloading OBS Studio ${obs_version} for Ubuntu 26.04..."
-    curl -fL --retry 3 -o ${obs_deb_path} \
-      "https://github.com/obsproject/obs-studio/releases/download/${obs_version}/${obs_deb}"
-    actual_hash="${$(sha256sum ${obs_deb_path})%% *}"
-  }
-
-  if [[ ${actual_hash} != ${expected_hash} ]] {
-    log_error "OBS Studio package checksum mismatch for ${obs_deb}."
+  } else {
+    log_error "/etc/os-release not found; cannot verify the Ubuntu version."
     return 2
   }
 
-  sudo apt-get install ${apt_args} -- ${obs_deb_path}
+  # Build the expected .deb filename and its local cache path.
+  local obs_deb="OBS-Studio-${obs_version}-Ubuntu-26.04-${arch}.deb"
+  local obs_deb_path="/tmp/${obs_deb}"
+  local expected_hash="${obs_deb_sha256[${obs_version}]}"
+  local actual_hash=''
 
+  # Reuse a previously downloaded .deb if its checksum already matches.
+  if [[ -f ${obs_deb_path} ]] actual_hash="${$(sha256sum ${obs_deb_path})%% *}"
+
+  # Otherwise download it from the official OBS GitHub release.
+  if [[ ${actual_hash} != ${expected_hash} ]] {
+    log_info "Downloading OBS Studio ${obs_version} for Ubuntu 26.04..."
+    curl -fL --retry 3 -o ${obs_deb_path} \
+      "https://github.com/obsproject/obs-studio/releases/download/${obs_version}/${obs_deb}" \
+      || { log_error "Download failed: ${obs_deb}"; return 2 }
+    actual_hash="${$(sha256sum ${obs_deb_path})%% *}"
+  }
+
+  # Refuse to install a .deb whose checksum does not match, and delete it
+  # so a corrupted file is not reused on the next run.
+  if [[ ${actual_hash} != ${expected_hash} ]] {
+    log_error "OBS Studio package checksum mismatch for ${obs_deb}."
+    rm -f -- ${obs_deb_path}
+    return 2
+  }
+
+  apt_with_retry sudo apt-get install ${apt_args} -- ${obs_deb_path}
+
+  # Confirm the installed headers actually provide the symbol the build needs.
   if [[ ! -f /usr/local/include/obs/graphics/image-file.h ]] || \
      ! grep -q 'gs_image_file_ex_t' /usr/local/include/obs/graphics/image-file.h; then
     log_error "Installed OBS headers do not provide gs_image_file_ex_t."
     return 2
   fi
 
+  # --- Qt ----------------------------------------------------------------
+
+  # Select the Qt development packages for the requested major version.
+  # ${suffix} adds the multiarch qualifier when cross-compiling.
   local -a _qt_packages=()
 
   if (( QT_VERSION == 5 )) {
@@ -110,6 +197,10 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
     )
   }
 
-  sudo apt-get install ${apt_args} ${_qt_packages}
+  apt_with_retry sudo apt-get install ${apt_args} ${_qt_packages}
+
   log_group
 }
+
+# Restore the caller's working directory.
+popd -q
