@@ -160,30 +160,31 @@ ${_usage_host:-}"
     pushd ${project_root}
     cmake --build build_${target##*-} --config ${config} -t package ${cmake_args}
     popd
-  } else {
-    log_group "Archiving ${product_name}..."
-    local output_name="${product_name}-${product_version}-${target##*-}-ubuntu-gnu"
-    local _tarflags='cJf'
-    if (( _loglevel > 1 || ${+CI} )) _tarflags="v${_tarflags}"
-
-    # User layout, installed by copying the folder into $XDG_DATA_HOME/obs-studio/plugins/:
-    #   <name>/<name>.so and <name>/data/. The FHS lib/ and share/ tree is only for the .deb.
-    local -a plugin_binaries=(${project_root}/release/${config}/lib/*/obs-plugins/${product_name}.so(N))
-    if (( ! ${#plugin_binaries} )) {
-      log_error "No ${product_name}.so found under release/${config}/lib."
-      return 2
-    }
-
-    local stage_dir="$(mktemp -d)"
-    mkdir -p ${stage_dir}/${product_name}/data
-    cp ${plugin_binaries[1]} ${stage_dir}/${product_name}/
-    cp -R ${project_root}/release/${config}/share/obs/obs-plugins/${product_name}/. ${stage_dir}/${product_name}/data/
-
-    pushd ${stage_dir}
-    XZ_OPT=-T0 tar "-${_tarflags}" ${project_root}/release/${output_name}.tar.xz ${product_name}
-    popd
-    rm -rf ${stage_dir}
   }
+
+  # User archive, always built: push and release runs also set package=true (which adds the .deb).
+  log_group "Archiving ${product_name}..."
+  local output_name="${product_name}-${product_version}-${target##*-}-ubuntu-gnu"
+  local _tarflags='cJf'
+  if (( _loglevel > 1 || ${+CI} )) _tarflags="v${_tarflags}"
+
+  # User layout, installed by copying the folder into $XDG_DATA_HOME/obs-studio/plugins/:
+  #   <name>/<name>.so and <name>/data/. The FHS lib/ and share/ tree is only for the .deb.
+  local -a plugin_binaries=(${project_root}/release/${config}/lib/*/obs-plugins/${product_name}.so(N))
+  if (( ! ${#plugin_binaries} )) {
+    log_error "No ${product_name}.so found under release/${config}/lib."
+    return 2
+  }
+
+  local stage_dir="$(mktemp -d)"
+  mkdir -p ${stage_dir}/${product_name}/data
+  cp ${plugin_binaries[1]} ${stage_dir}/${product_name}/
+  cp -R ${project_root}/release/${config}/share/obs/obs-plugins/${product_name}/. ${stage_dir}/${product_name}/data/
+
+  pushd ${stage_dir}
+  XZ_OPT=-T0 tar "-${_tarflags}" ${project_root}/release/${output_name}.tar.xz ${product_name}
+  popd
+  rm -rf ${stage_dir}
   log_group
 }
 
