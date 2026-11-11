@@ -22,14 +22,9 @@ function(set_target_properties_plugin target)
 
   set_target_properties(${target} PROPERTIES VERSION 0 SOVERSION ${PLUGIN_VERSION})
 
-  install(TARGETS ${target} RUNTIME DESTINATION "${target}/bin/64bit" LIBRARY DESTINATION "${target}/bin/64bit")
-
-  install(
-    FILES "$<TARGET_PDB_FILE:${target}>"
-    CONFIGURATIONS RelWithDebInfo Debug Release
-    DESTINATION "${target}/bin/64bit"
-    OPTIONAL
-  )
+  # Flat layout: <plugin>/<plugin>.dll next to <plugin>/data/. This is the non-legacy layout OBS 33 scans
+  # in %ProgramData%\obs-studio\plugins\ on Windows (bin/64bit is only loaded as a legacy plugin).
+  install(TARGETS ${target} RUNTIME DESTINATION "${target}" LIBRARY DESTINATION "${target}")
 
   if(TARGET plugin-support)
     target_link_libraries(${target} PRIVATE plugin-support)
