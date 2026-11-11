@@ -1,67 +1,112 @@
-autoload -Uz log_info log_status log_error log_debug log_warning log_group
+autoload -Uz log_error log_status log_warning log_debug log_group is-at-least
 
 log_group 'Check Linux build requirements'
 log_debug 'Checking Linux distribution name and version...'
 
-# Check for Ubuntu version 22.10 or later, which have srt and librist available via apt-get
+# Ubuntu 22.10+ provides srt and librist through apt-get.
+# The file is /etc/os-release (hyphen). The previous version tested
+# /etc/os_release, which does not exist, so this flag was never set.
 typeset -g -i UBUNTU_2210_OR_LATER=0
-if [[ -f /etc/os_release ]] {
-  local dist_name
-  local dist_version
-  read -r dist_name dist_version <<< "$(source /etc/os_release; print "${NAME} ${VERSION_ID}")"
-
-  autoload -Uz is-at-least
+if [[ -f /etc/os-release ]] {
+  local dist_name dist_version
+  read -r dist_name dist_version <<< "$(source /etc/os-release; print -- "${NAME} ${VERSION_ID}")"
   if [[ ${dist_name} == Ubuntu ]] && is-at-least 22.10 ${dist_version}; then
-    typeset -g -i UBUNTU_2210_OR_LATER=1
+    UBUNTU_2210_OR_LATER=1
   fi
+} else {
+  log_warning 'No /etc/os-release found; cannot detect the distribution.'
 }
 
 log_debug 'Checking for apt-get...'
 if (( ! ${+commands[apt-get]} )) {
   log_error 'No apt-get command found. Please install apt'
   return 2
-} else {
-  log_debug "Apt-get located at ${commands[apt-get]}"
+}
+log_debug "Apt-get located at ${commands[apt-get]}"
+
+# Packages that are useful but not required for the build. If they cannot be
+# installed, the step warns and continues instead of failing the job.
+typeset -g -a OPTIONAL_APT_PACKAGES=(ccache)
+
+# Ubuntu mirror hosts used by the runner's apt configuration.
+typeset -g -a APT_MIRROR_HOSTS=(
+  archive.ubuntu.com
+  security.ubuntu.com
+  azure.archive.ubuntu.com
+)
+
+# Warn early if none of the Ubuntu mirror hosts resolve. This is almost
+# always a DNS problem on the runner, which the script cannot fix itself.
+check_apt_mirrors() {
+  local host
+  for host (${APT_MIRROR_HOSTS}) {
+    if getent hosts ${host} >/dev/null 2>&1 {
+      return 0
+    }
+  }
+  log_warning "None of the Ubuntu mirror hosts resolve (${APT_MIRROR_HOSTS}). This is a DNS problem on the runner."
+  return 1
 }
 
-# Runner mirrors and DNS can fail transiently ("Temporary failure resolving ..."), so retry apt commands.
+# Run a command up to 3 times with backoff (15s, then 30s).
+# Between attempts, refresh the package lists so a retry does not reuse
+# a half-fetched index.
 apt_with_retry() {
   local -i attempt
-  for attempt in 1 2 3; do
+  local -i delay=15
+  for attempt in {1..3}; do
     if "$@"; then
       return 0
     fi
     if (( attempt < 3 )) {
-      log_warning "Attempt ${attempt} failed: $*. Retrying in 15 seconds..."
-      sleep 15
+      log_warning "Attempt ${attempt} failed: $*. Retrying in ${delay} seconds..."
+      check_apt_mirrors || true
+      sleep ${delay}
+      (( delay *= 2 ))
+      sudo apt-get update -qq >/dev/null 2>&1 || true
     }
   done
   log_error "Failed after 3 attempts: $*"
   return 2
 }
 
-local -a dependencies=("${(fA)$(<${SCRIPT_HOME}/.Aptfile)}")
-local -a install_list
-local binary
+# Read the .Aptfile and collect the packages whose binary is not already on PATH.
+if [[ ! -f ${SCRIPT_HOME}/.Aptfile ]] {
+  log_error "Missing ${SCRIPT_HOME}/.Aptfile"
+  return 2
+}
 
-apt_with_retry sudo apt-get update -qq
+local -a dependencies=("${(fA)$(<${SCRIPT_HOME}/.Aptfile)}")
+local -a install_list=()
+local -a optional_list=()
+local -a tokens
+local binary pkg dependency
 
 for dependency (${dependencies}) {
-  local -a tokens=(${=dependency//(,|:|\')/})
+  tokens=(${=dependency//(,|:|\')/})
 
-  if [[ ! ${tokens[1]} == 'package' ]] continue
+  if [[ ${tokens[1]} != package ]] continue
 
-  if [[ ${#tokens} -gt 2 && ${tokens[3]} == 'bin' ]] {
+  if [[ ${#tokens} -gt 2 && ${tokens[3]} == bin ]] {
     binary=${tokens[4]}
   } else {
     binary=${tokens[2]}
   }
 
-  if (( ! ${+commands[${binary}]} )) install_list+=(${tokens[2]})
+  if (( ${+commands[${binary}]} )) continue
+
+  pkg=${tokens[2]}
+  if (( ${OPTIONAL_APT_PACKAGES[(Ie)${pkg}]} )) {
+    optional_list+=(${pkg})
+  } else {
+    install_list+=(${pkg})
+  }
 }
 
-log_debug "List of dependencies to install: ${install_list}"
-if (( ${#install_list} )) {
+log_debug "Required apt packages missing: ${install_list}"
+log_debug "Optional apt packages missing: ${optional_list}"
+
+if (( ${#install_list} + ${#optional_list} )) {
   if (( ! ${+CI} )) log_warning 'Dependency installation via apt may require elevated privileges'
 
   local -a apt_args=(
@@ -70,7 +115,22 @@ if (( ${#install_list} )) {
   )
   if (( _loglevel == 0 )) apt_args+=(--quiet)
 
-  apt_with_retry sudo apt-get ${apt_args} install ${install_list}
+  check_apt_mirrors || true
+
+  # The package lists are needed for any install, so failure here is fatal.
+  apt_with_retry sudo apt-get update -qq || return 2
+
+  if (( ${#install_list} )) {
+    apt_with_retry sudo apt-get ${apt_args} install ${install_list} || return 2
+  }
+
+  if (( ${#optional_list} )) {
+    if ! apt_with_retry sudo apt-get ${apt_args} install ${optional_list}; then
+      log_warning "Optional packages could not be installed (${optional_list}). Continuing without them."
+    fi
+  }
+} else {
+  log_status 'All apt build requirements are already installed.'
 }
 
 rehash
